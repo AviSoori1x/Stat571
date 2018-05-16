@@ -1,0 +1,450 @@
+---
+title: "STAT 701 FINAL"
+author:
+- Group 33
+- Suraj Shah
+- Timothy Hill
+- Avinash Sooriyarachchi
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+```{r}
+
+library(pROC)
+library(glmnet)
+library(neuralnet)
+library(GGally)
+library(reshape2)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = "hide", fig.width=6, fig.height=4)
+if(!require('pacman')) {
+  install.packages('pacman')
+}
+pacman::p_load(pROC, leaps, car, tidyverse, mapproj, caret)
+```
+
+
+## EDA
+
+In order to best understand the data before attempting to create a classification model we will explore it.
+
+To begin an overview:
+```{r}
+Kaggle_Test_Dataset <- read.csv("Kaggle_Test_Dataset_v2.csv")
+dim(Kaggle_Test_Dataset)
+```
+There are 242,076 observations with 23 variables.
+
+The variables of the dataset are as follows:
+```{r}
+names(Kaggle_Test_Dataset)
+```
+
+The variables are defined as follows:
+
+*sku - Random ID for the product
+*national_inv - Current inventory level for the part
+*lead_time - Transit time for product (if available)
+*in_transit_qty - Amount of product in transit from source
+*forecast_3_month - Forecast sales for the next 3 months
+*forecast_6_month - Forecast sales for the next 6 months
+*forecast_9_month - Forecast sales for the next 9 months
+*sales_1_month - Sales quantity for the prior 1 month time period 
+*sales_3_month - Sales quantity for the prior 3 month time period 
+*sales_6_month - Sales quantity for the prior 6 month time period 
+*sales_9_month - Sales quantity for the prior 9 month time period 
+*min_bank - Minimum recommend amount to stock
+*potential_issue - Source issue for part identified
+*pieces_past_due - Parts overdue from source
+*perf_6_month_avg - Source performance for prior 6 month period 
+*perf_12_month_avg - Source performance for prior 12 month period 
+*local_bo_qty - Amount of stock orders overdue
+*deck_risk - Part risk flag
+*oe_constraint - Part risk flag
+*ppap_risk - Part risk flag
+*stop_auto_buy - Part risk flag
+*rev_stop - Part risk flag
+*went_on_backorder - Product actually went on backorder. 
+
+Our main variable of interest is "went_on_backorder." We deem an item on backorder as a failure of the supply chain. The goal of the project is to create a classification model to help identify the factors that best predict when an item will likely go on backorder.
+
+Here is a quick look of how the data in each variable looks:
+```{r}
+str(Kaggle_Test_Dataset)
+```
+
+There aren't too many problems iwth the data set, however, if we were to move forward with sku we would be unable to run any sort of analysis on the data. 
+It is a factor with 240,000 levels and does not add any value to the data (it simply defines each individual inventory item). It greatly increases computational expense and thusly we will omit it.
+
+```{r}
+Kaggle_Test_Dataset<-Kaggle_Test_Dataset[,-1]
+```
+
+
+Another potential problem in the data is that the lead_time variable has NA values.
+
+```{r}
+length(which(is.na(Kaggle_Test_Dataset$lead_time)))
+```
+
+There are 14,725 observations with NA lead times. Given that lead time is likely an important factor on whether a part is backordered it may be best to remove these values from the dataset. We will leave them in for the time being.
+
+```{r}
+sum(is.na(Kaggle_Test_Dataset))
+```
+
+There are a total of 14739 NA values in the data set, and with 14725 of them occuring in the lead time variable it shows that almost all NA values occur here.
+
+```{r}
+apply(Kaggle_Test_Dataset, 2, function(x) any(is.na(x))) 
+```
+The rest of the NA values are spread out amongst many other variables. There is not a significant amount.
+
+As previously mentioned, our column of main interest is went_on_backorder.
+```{r}
+summary(Kaggle_Test_Dataset$went_on_backorder)
+```
+This factor has 3 values, "No" and "Yes." 1.1% of all sku's went on backorder.
+The factor is also flawed in that there is a blank value.
+```{r}
+which(Kaggle_Test_Dataset$went_on_backorder == "")
+```
+It is the last row in the data set. We will remove that row from the data set and refactor the variable.
+
+```{r}
+Kaggle_Test_Dataset <- Kaggle_Test_Dataset[-242076,]
+
+Kaggle_Test_Dataset$went_on_backorder<-factor(Kaggle_Test_Dataset$went_on_backorder)
+
+###Test Summary
+summary(Kaggle_Test_Dataset$went_on_backorder)
+
+```
+
+
+Now we eliminate the NA values from the dataset for easier analysis. Since so few items were NA, and there seems to be no specific reason for the NA values,
+we will choose to ignore them.
+
+```{r}
+Kaggle_clean<-na.omit(Kaggle_Test_Dataset)
+```
+
+The data is now prepared for more exploration, however to better be able to manuever through the data we will limit its size. With 240k rows of data it is simply too unwieldy in its current state. As such we are taking a sample of 10,000 rows to use going forward.
+```{r}
+set.seed(123)
+n=nrow(Kaggle_clean)
+test.index <- sample(n, 10000)
+length(test.index)
+Kaggle_sample <- Kaggle_clean[test.index,]
+names(Kaggle_sample)
+dim(Kaggle_sample)
+```
+
+At 0.949 sales_6_month and sales_1_month are highly correlated. This is not to be unexpected as they are similar variables.
+We will also run a correlation heatmap to get a better view of all variables in the sample.
+```{r, warning=FALSE}
+Kaggle_sample %>%
+  select_if(is.numeric) %>%
+  qplot(x = Var1,
+        y = Var2,
+        data = melt(cor(
+          Kaggle_sample %>%
+          select_if(is.numeric))),
+        fill = value,
+        geom = "tile") +
+  
+    xlab("") +
+    ylab("") +
+    guides(fill = guide_legend(title = "Correlation")) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+
+Again we see that sales and forecast are highly correlated in their montly increments. We will keep this of note for our final models. 
+Now we will run a simple logistic regression on the data using lead time.
+```{r}
+fit1 <- glm(went_on_backorder~lead_time, data = Kaggle_sample, family=binomial(logit))
+summary(fit1)
+```
+
+Roc curve of the single variable (lead_time) classifier.
+```{r}
+fit1 <- glm(went_on_backorder~lead_time, data = Kaggle_sample, family=binomial(logit))
+fit1.roc <- roc(Kaggle_sample$went_on_backorder, fit1$fitted, plot=T, col="blue")
+pROC::auc(fit1.roc)
+```
+With an AUC of 0.5556 this single classifier is not good enough on its own to help define backorders, however, it is a good start.
+
+
+## LASSO
+A categorical variable is coded with indicator functions.
+```{r}
+X <- model.matrix(went_on_backorder~., data=Kaggle_sample)[,-1]
+dim(X)
+```
+
+
+```{r}
+Y <- Kaggle_sample[, 22]
+```
+
+
+```{r}
+summary(Kaggle_sample$went_on_backorder)
+```
+
+
+
+```{r}
+set.seed(10)
+fit1.cv <- cv.glmnet(X, Y, alpha=1, family="binomial", nfolds = 10, type.measure = "deviance")
+
+```
+
+```{r}
+plot(fit1.cv)
+```
+
+
+```{r}
+coef.min <- coef(fit1.cv, s="lambda.min")  
+coef.min <- coef.min[which(coef.min !=0),] 
+coef.min
+```
+
+```{r, warning=FALSE}
+fit.logit.1<-
+  glm(went_on_backorder~national_inv+lead_time+in_transit_qty+perf_6_month_avg+deck_risk, family=binomial, data=Kaggle_sample)
+Anova(fit.logit.1)
+```
+
+Backward selection
+```{r, warning=FALSE}
+fit.logit.1<-
+  glm(went_on_backorder~national_inv+lead_time+perf_6_month_avg+deck_risk, family=binomial, data=Kaggle_sample)
+Anova(fit.logit.1)
+```
+
+```{r, warning=FALSE}
+fit.logit.1<-
+  glm(went_on_backorder~national_inv+lead_time+deck_risk, family=binomial, data=Kaggle_sample)
+Anova(fit.logit.1)
+```
+
+
+```{r, warning=FALSE}
+fit.logit.1<-glm(went_on_backorder~national_inv+deck_risk, family=binomial, data=Kaggle_sample)
+Anova(fit.logit.1)
+```
+
+
+```{r}
+
+fit2.roc <- roc(Kaggle_sample$went_on_backorder, fit.logit.1$fitted, plot=T, col="blue")
+pROC::auc(fit2.roc)
+```
+##Random Forest
+
+Generate Random Forest
+```{r}
+library(randomForest)
+rf<-randomForest(went_on_backorder~.,data=Kaggle_sample, mtry=21, ntree=500)
+```
+
+
+```{r}
+print(rf)
+varImpPlot(rf, sort = T, n.var = 15)
+```
+
+OLS backward selection
+```{r, warning=FALSE}
+linfit1<-glm(went_on_backorder~.,family=binomial, data=Kaggle_sample)
+summary(linfit1)
+```
+
+
+```{r}
+names(Kaggle_sample)
+```
+
+
+
+```{r}
+str(Kaggle_sample)
+```
+
+```{r}
+Kaggle_sample$national_inv <- 
+  (Kaggle_sample$national_inv-min(Kaggle_sample$national_inv))/
+  (max(Kaggle_sample$national_inv)-min(Kaggle_sample$national_inv))
+
+Kaggle_sample$lead_time <- 
+  (Kaggle_sample$lead_time-min(Kaggle_sample$lead_time))/
+  (max(Kaggle_sample$lead_time)-min(Kaggle_sample$lead_time))
+Kaggle_sample$in_transit_qty <- 
+  (Kaggle_sample$in_transit_qty-min(Kaggle_sample$in_transit_qty))/
+  (max(Kaggle_sample$in_transit_qty)-min(Kaggle_sample$in_transit_qty))
+Kaggle_sample$forecast_3_month <- 
+  (Kaggle_sample$forecast_3_month-min(Kaggle_sample$forecast_3_month))/
+  (max(Kaggle_sample$forecast_3_month)-min(Kaggle_sample$forecast_3_month))
+Kaggle_sample$forecast_6_month <- 
+  (Kaggle_sample$forecast_6_month-min(Kaggle_sample$forecast_6_month))/
+  (max(Kaggle_sample$forecast_6_month)-min(Kaggle_sample$forecast_6_month))
+Kaggle_sample$forecast_9_month <- 
+  (Kaggle_sample$forecast_9_month-min(Kaggle_sample$forecast_9_month))/
+  (max(Kaggle_sample$forecast_9_month)-min(Kaggle_sample$forecast_9_month))
+Kaggle_sample$sales_1_month <- 
+  (Kaggle_sample$sales_1_month-min(Kaggle_sample$sales_1_month))/
+  (max(Kaggle_sample$sales_1_month)-min(Kaggle_sample$sales_1_month))
+Kaggle_sample$sales_3_month <- 
+  (Kaggle_sample$sales_3_month-min(Kaggle_sample$sales_3_month))/
+  (max(Kaggle_sample$sales_3_month)-min(Kaggle_sample$sales_3_month))
+Kaggle_sample$sales_6_month <- 
+  (Kaggle_sample$sales_6_month-min(Kaggle_sample$sales_6_month))/
+  (max(Kaggle_sample$sales_6_month)-min(Kaggle_sample$sales_6_month))
+Kaggle_sample$sales_9_month <- 
+  (Kaggle_sample$sales_9_month-min(Kaggle_sample$sales_9_month))/
+  (max(Kaggle_sample$sales_9_month)-min(Kaggle_sample$sales_9_month))
+Kaggle_sample$min_bank <- 
+  (Kaggle_sample$min_bank-min(Kaggle_sample$min_bank))/
+  (max(Kaggle_sample$min_bank)-min(Kaggle_sample$min_bank))
+Kaggle_sample$pieces_past_due <- 
+  (Kaggle_sample$pieces_past_due-min(Kaggle_sample$pieces_past_due))/
+  (max(Kaggle_sample$pieces_past_due)-min(Kaggle_sample$pieces_past_due))
+Kaggle_sample$perf_6_month_avg <- 
+  (Kaggle_sample$perf_6_month_avg-min(Kaggle_sample$perf_6_month_avg))/
+  (max(Kaggle_sample$perf_6_month_avg)-min(Kaggle_sample$perf_6_month_avg))
+Kaggle_sample$perf_12_month_avg <- 
+  (Kaggle_sample$perf_12_month_avg-min(Kaggle_sample$perf_12_month_avg))/
+  (max(Kaggle_sample$perf_12_month_avg)-min(Kaggle_sample$perf_12_month_avg))
+Kaggle_sample$local_bo_qty <- 
+  (Kaggle_sample$local_bo_qty-min(Kaggle_sample$local_bo_qty))/
+  (max(Kaggle_sample$local_bo_qty)-min(Kaggle_sample$local_bo_qty))
+
+
+
+```
+
+
+
+Typecasting
+```{r}
+Kaggle_sample$national_inv <- as.numeric(Kaggle_sample$national_inv)
+Kaggle_sample$lead_time <- as.numeric(Kaggle_sample$lead_time )
+Kaggle_sample$in_transit_qty <- as.numeric(Kaggle_sample$in_transit_qty)
+Kaggle_sample$forecast_3_month <- as.numeric(Kaggle_sample$forecast_3_month)
+Kaggle_sample$forecast_6_month <- as.numeric(Kaggle_sample$forecast_6_month)
+Kaggle_sample$forecast_9_month <- as.numeric(Kaggle_sample$forecast_9_month)
+Kaggle_sample$sales_1_month <- as.numeric(Kaggle_sample$sales_1_month)
+Kaggle_sample$sales_3_month <- as.numeric(Kaggle_sample$sales_3_month)
+Kaggle_sample$sales_6_month <- as.numeric(Kaggle_sample$sales_6_month)
+Kaggle_sample$sales_9_month <- as.numeric(Kaggle_sample$sales_9_month)
+Kaggle_sample$min_bank <- as.numeric(Kaggle_sample$min_bank)
+Kaggle_sample$pieces_past_due <- as.numeric(Kaggle_sample$pieces_past_due)
+Kaggle_sample$perf_6_month_avg <- as.numeric(Kaggle_sample$perf_6_month_avg)
+Kaggle_sample$perf_12_month_avg <- as.numeric(Kaggle_sample$perf_12_month_avg)
+Kaggle_sample$local_bo_qty <- as.numeric(Kaggle_sample$local_bo_qty)
+Kaggle_sample$potential_issue <- as.numeric(Kaggle_sample$potential_issue)
+Kaggle_sample$deck_risk <- as.numeric(Kaggle_sample$deck_risk)
+Kaggle_sample$oe_constraint <- as.numeric(Kaggle_sample$oe_constraint)
+Kaggle_sample$ppap_risk <- as.numeric(Kaggle_sample$ppap_risk)
+Kaggle_sample$stop_auto_buy <- as.numeric(Kaggle_sample$stop_auto_buy)
+Kaggle_sample$rev_stop <- as.numeric(Kaggle_sample$rev_stop)
+
+
+Kaggle_sample$went_on_backorder <- as.numeric(Kaggle_sample$went_on_backorder)
+
+str(Kaggle_sample)
+```
+
+```{r}
+n <- neuralnet(went_on_backorder~national_inv+lead_time+in_transit_qty+forecast_9_month+forecast_6_month+forecast_3_month+sales_1_month+sales_3_month+sales_6_month+sales_9_month+min_bank+pieces_past_due+potential_issue+perf_12_month_avg+perf_6_month_avg+local_bo_qty+deck_risk+oe_constraint+ppap_risk+stop_auto_buy+rev_stop, data=Kaggle_sample, hidden = 3, err.fct = "sse", linear.output = FALSE)
+  
+  
+plot(n)  
+summary(n)
+```
+The neural network consisting of 21 predictors and one hidden layer with three neurons. These predict the outcome i.e. went on backorder in a manner akin to that of the human brain. However, please note that the error accrued following this method was 57.5% which is rather high.
+```{r}
+n$result.matrix
+```
+
+
+##PCA
+
+```{r}
+data.scale <- scale(Kaggle_sample, center=TRUE, scale =TRUE)
+pca.all <- prcomp(Kaggle_sample , scale =TRUE)
+pr.var <- pca.all$sdev^2
+pve <- pr.var/sum(pr.var)
+plot(pve , xlab=" Principal Component ",
+ylab=" Proportion of Variance Explained ", ylim=c(0,1) ,type='b')
+pve <- pr.var/sum(pr.var)
+pve
+```
+The 'elbow' following the second principal component implies that the first 2 principal components explain much of the variance in the model.Specifically, the first principal component explains 32.4% of the variance and the second principal component explains 8.96% of the variance.
+
+```{r}
+plot(cumsum (pve), xlab=" Principal Component ",
+ylab ="Cumulative Proportion of Variance Explained ", ylim=c(0,1) ,type='b')
+```
+
+```{r}
+PCAresult <- cor(pca.all$x)
+trunc(PCAresult)
+```
+
+The above correlations indicate that all principal components are orthogonal to one another. In the above matrix representation of correlations, the diagonals are 1 . i.e. correlations of each Principal component with itslef, as expected. The rest are 0. Note that without truncating these values, R internally computes these as infinitesimally small decimal values due to the nature of floating point operations.
+
+
+```{r}
+plot(pca.all$x[, 1], pca.all$x[,2 ], pch=5,
+     xlim=c(-4, 4),
+     ylim=c(-4, 4),
+     main="The leading two principal components",
+     xlab="Z1=PC1", 
+     ylab="Z2=PC2"
+     )
+abline(h=0, v=0)
+```
+The two principal components are indicated by the vertical and horizontal axes of the above plot. It can be clearly seen that the observations vary strongly along these two axes. This 
+explains the variability observed in the scree plot given before.
+
+```{r}
+library(e1071)
+Kaggle_sample$went_on_backorder <- as.factor(Kaggle_sample$went_on_backorder)
+mymodel <- svm(went_on_backorder~.,data=Kaggle_sample)
+summary(mymodel)
+```
+
+```{r}
+# Support Vector Machines 
+pred <- predict(mymodel, Kaggle_sample) 
+tab <- table(Predicted= pred, Actual= Kaggle_sample$went_on_backorder)
+tab
+```
+```{r}
+set.seed(123)
+tmodel <- 
+tune(svm,went_on_backorder~.,data=Kaggle_sample, ranges= list(epsilon = seq(0,1,0.1), cost= 2^(2:7)) )
+```
+
+```{r}
+plot(tmodel)
+summary(tmodel)
+```
+
+```{r}
+mymodel <- tmodel$best.model
+pred <- predict(mymodel, Kaggle_sample) 
+tab <- table(Predicted= pred, Actual= Kaggle_sample$went_on_backorder)
+tab
+```
+
+
+
